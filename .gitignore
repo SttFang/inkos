@@ -19,5 +19,7 @@ novel-to-comic-research.docx
 tmp/
 autoresearch/
 .playwright-cli/
-.superpowers/
+.superpowers/*
+!.superpowers/specs/
+!.superpowers/specs/**
 _*.md
