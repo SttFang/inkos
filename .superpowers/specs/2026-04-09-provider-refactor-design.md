@@ -64,7 +64,7 @@
 **沉没成本评估**：
 - `chore(gitignore): track design specs` — 不受影响，保留
 - `docs: add CLAUDE.md with atomic commit convention` — 不受影响，保留
-- `docs(llm): add provider refactor design spec` — **本次覆盖替换**，§5-§10 重写，§11-§17 大部分保留
+- `docs(llm): add provider refactor design spec` — **本次覆盖替换**；v1 的自写工厂相关章节（原 §5-§10）重写为 AI SDK 底座方案；原 §11 Pool + Router 被删除（见 §2.2 YAGNI 理由）；其余章节保留
 
 ## 2. 目标与非目标
 
@@ -76,38 +76,29 @@
 - **T4**：tool-calling 与 simple chat 共享全部健壮性（fallback、partial salvage、错误包装）——这是 AI SDK `streamText` 原生行为
 - **T5**：代理怪毛病通过 `createOpenAICompatible({fetch, headers, queryParams})` 的自定义 `fetch` 钩子隔离到对应 provider 文件
 - **T6**：所有 7 个调用点**零修改**（通过兼容 shim 实现）
-- **T7**：为未来路由层预留接缝——`LLMPool.chat({ task, ... })` 的 API 形状固定下来
-- **T8**：完整测试覆盖 + 真实 API smoke 测试矩阵（见 §18）
+- **T7**：完整测试覆盖 + 真实 API smoke 测试矩阵（见 §17）
 
 ### 2.2 非目标
 
 - ❌ **不加新 provider**（不实现 DeepSeek、Moonshot、Gemini、Ollama 等——但架构支持 ~15 行配置即可扩展）
 - ❌ **不加新能力**（不使用 AI SDK 的 `embed`、`generateObject`、`textToImage`，虽然它们都是免费的）
-- ❌ **不实现完整的路由逻辑**（只打桩 `DirectRouter` 做显式映射）
+- ❌ **不引入路由层**（YAGNI——当前每次 chat 都只走唯一配置的 runtime。未来需要自动路由时再加 `LLMPool` 作为一层 wrapper，那是局部 refactor，唯一的触点是 compat shim 内部的一行）
 - ❌ **不修改调用方代码**（7 个消费点一行不动）
 - ❌ **不改变对外观察到的行为**（除 tool-calling 新增的对齐能力，那是硬化）
 
 ## 3. 架构总览
 
-### 3.1 四层模型
+### 3.1 三层模型
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
-│  Layer 4: Pipeline / Agents（本次不动）                         │
+│  Layer 3: Pipeline / Agents（本次不动）                         │
 │  writer / auditor / planner / settler / ...                   │
 └───────────────────────┬───────────────────────────────────────┘
                         │ 通过兼容 shim：createLLMClient / chatCompletion / chatWithTools
                         ▼
 ┌───────────────────────────────────────────────────────────────┐
-│  Layer 3: LLMPool + Router（本次打桩）                          │
-│  • 多 runtime 按 alias 注册                                     │
-│  • Router 接口 + DirectRouter 实现（显式映射）                    │
-│  • 未来扩展：CapabilityRouter / CostRouter / FallbackRouter     │
-└───────────────────────┬───────────────────────────────────────┘
-                        │ runtime.chat(payload)
-                        ▼
-┌───────────────────────────────────────────────────────────────┐
-│  Layer 2: Orchestrator（单个函数：chat payload → ChatResult） │
+│  Layer 2: Orchestrator（LLMRuntime.chat() 的实现）             │
 │  • 调 AI SDK streamText() 或 generateText()                    │
 │  • 消费 result.fullStream 缓冲 text + 收集 tool calls          │
 │  • stream → sync fallback（AI SDK 错误 → generateText 重试）   │
@@ -119,7 +110,7 @@
 ┌───────────────────────────────────────────────────────────────┐
 │  Layer 1: LLMRuntime（concrete class, thin wrapper）          │
 │                                                                │
-│  LLMRuntime = { id, LanguageModelV2, defaults, quirks? }     │
+│  LLMRuntime = { id, LanguageModelV2, defaults, providerName } │
 │  LanguageModelV2 由 AI SDK 工厂生成：                           │
 │  ├── createOpenAI({fetch, headers, ...})                      │
 │  │     .chat(model)       ← openai-chat provider              │
@@ -132,6 +123,8 @@
 │  我们不写任何 SDK 包装代码。                                     │
 └───────────────────────────────────────────────────────────────┘
 ```
+
+**未来自动路由的位置**：当需要"不同模型做不同任务"时，在 compat shim 和 Layer 1 之间插一个 `LLMPool + Router` 层。当前 shim 只有一行 `const runtime = build(config); return { runtime, ... };`——未来替换成 `pool.register(...); return { pool, ... }; chatCompletion → pool.chat({task, ...})`。是一次局部改动，不涉及 runtime/orchestrator/providers 的任何文件。
 
 ### 3.2 模块布局
 
@@ -159,11 +152,6 @@ packages/core/src/llm/
 │
 ├── dispatch/
 │   └── config-builders.ts                  # {match, build}[] 表（从 LLMConfig 构造 runtime）
-│
-├── pool/
-│   ├── pool.ts                             # LLMPool 类
-│   ├── router.ts                           # Router 接口 + DirectRouter
-│   └── types.ts                            # TaskIntent + 预定义常量
 │
 ├── errors/
 │   ├── types.ts                            # LLMError 基类 + 8 个 ErrorType
@@ -681,88 +669,31 @@ export function resolveProviderId(config: LLMConfig): ProviderId {
 
 Cherry Studio 的 `{match, build}[]` 模式被完整保留。加新 provider = 数组末尾加一条。
 
-## 11. Pool + DirectRouter（Layer 3 打桩，v1 不变）
-
-```ts
-// pool/types.ts
-export type TaskIntent = string;
-export const TaskIntents = {
-  WriteChapter: "write-chapter",
-  Audit: "audit",
-  Plan: "plan",
-  Revise: "revise",
-  Summarize: "summarize",
-  ToolAgent: "tool-agent",
-} as const;
-```
-
-```ts
-// pool/router.ts
-export interface Router {
-  route(intent: TaskIntent | undefined, explicit?: string): string;
-}
-
-export class DirectRouter implements Router {
-  constructor(
-    private readonly taskMap: ReadonlyMap<TaskIntent, string>,
-    private readonly defaultAlias: string,
-  ) {}
-
-  route(intent: TaskIntent | undefined, explicit?: string): string {
-    if (explicit) return explicit;
-    if (intent && this.taskMap.has(intent)) return this.taskMap.get(intent)!;
-    return this.defaultAlias;
-  }
-}
-```
-
-```ts
-// pool/pool.ts
-import type { LLMRuntime } from "../runtime/runtime.js";
-import type { ChatPayload, ChatResult } from "../types/payload.js";
-import type { TaskIntent } from "./types.js";
-import type { Router } from "./router.js";
-
-export class LLMPool {
-  private readonly runtimes = new Map<string, LLMRuntime>();
-
-  constructor(private readonly router: Router) {}
-
-  register(alias: string, runtime: LLMRuntime): void {
-    this.runtimes.set(alias, runtime);
-  }
-
-  async chat(req: ChatPayload & { task?: TaskIntent; alias?: string }): Promise<ChatResult> {
-    const alias = this.router.route(req.task, req.alias);
-    const runtime = this.runtimes.get(alias);
-    if (!runtime) throw new Error(`No runtime registered for alias "${alias}"`);
-    return runtime.chat(req);
-  }
-}
-```
-
-**未来扩展路径**：`CapabilityRouter`（按模型能力表打分）、`CostRouter`（按成本优先）、`FallbackRouter`（失败降级）。本次均不实现。
-
-## 12. 向后兼容 Shim
+## 11. 向后兼容 Shim
 
 ```ts
 // compat/legacy-api.ts
-import { LLMPool } from "../pool/pool.js";
-import { DirectRouter } from "../pool/router.js";
 import { providerBuilders } from "../providers/registry.js";
 import { resolveProviderId } from "../dispatch/config-builders.js";
 import type { LLMConfig } from "../../models/project.js";
+import type { LLMRuntime } from "../runtime/runtime.js";
 
-/** 老接口：保持符号、保持签名。内部转成 Pool + DirectRouter。 */
+export interface LLMClient {
+  readonly _runtime: LLMRuntime;       // ← 未来加 Pool 时替换为 _pool: LLMPool
+  readonly provider: string;
+  readonly defaults: RuntimeDefaults;
+  readonly apiFormat: "chat" | "responses";
+  readonly stream: boolean;
+}
+
+/** 老接口：保持符号、保持签名。内部直接持有一个 runtime。 */
 export function createLLMClient(config: LLMConfig): LLMClient {
   const providerId = resolveProviderId(config);
   const build = providerBuilders[providerId];
   const runtime = build(config);
-  const pool = new LLMPool(new DirectRouter(new Map(), "default"));
-  pool.register("default", runtime);
   // 不再包含 _openai / _anthropic 字段（自审确认无生产消费）
   return {
-    _pool: pool,
+    _runtime: runtime,
     provider: config.provider,
     defaults: runtime.defaults,
     apiFormat: config.apiFormat ?? "chat",
@@ -776,7 +707,7 @@ export async function chatCompletion(
   messages: ReadonlyArray<LLMMessage>,
   options?: { temperature?: number; maxTokens?: number; webSearch?: boolean; onStreamProgress?: OnStreamProgress },
 ): Promise<LLMResponse> {
-  const result = await client._pool.chat({ model, messages, ...options });
+  const result = await client._runtime.chat({ model, messages, ...options });
   return { content: result.content, usage: result.usage };
 }
 
@@ -787,7 +718,7 @@ export async function chatWithTools(
   tools: ReadonlyArray<ToolDefinition>,
   options?: { temperature?: number; maxTokens?: number },
 ): Promise<ChatWithToolsResult> {
-  const result = await client._pool.chat({
+  const result = await client._runtime.chat({
     model,
     messages: adaptAgentMessages(messages),
     tools,
@@ -797,21 +728,22 @@ export async function chatWithTools(
 }
 ```
 
+**未来加路由时的改动**（本次不实现）：`_runtime: LLMRuntime` 换成 `_pool: LLMPool`，`createLLMClient` 改为 `new LLMPool().register("default", runtime)`，`chatCompletion/chatWithTools` 内部的 `client._runtime.chat(...)` 改成 `client._pool.chat({task, ...})`。唯一需要同时改的文件是 `compat/legacy-api.ts`。
+
 **导出符号对齐**：`index.ts` 重新导出 `createLLMClient`、`chatCompletion`、`chatWithTools`、`createStreamMonitor`、`PartialResponseError`（降级为 `@deprecated` 空壳类）、所有 type alias。**7 个调用点一行不动**。
 
-## 13. 测试策略
+## 12. 测试策略
 
-### 13.1 单元测试层级
+### 12.1 单元测试层级
 
 - **`runtime/message-adapter.test.ts`**：`AgentMessage` ↔ AI SDK `ModelMessage` 双向转换，包括 tool call 和 tool result 的合并逻辑
 - **`runtime/orchestrator.test.ts`**：mock AI SDK 的 `streamText` / `generateText`（通过 `@ai-sdk/provider` 的 `MockLanguageModelV2`），验证 fallback、salvage、error mapping
 - **`quirks/proxy-quirks.test.ts`**：mock 全局 `fetch`，验证请求/响应改写
 - **`errors/mapper.test.ts`**：AI SDK `APICallError` / `NoObjectGeneratedError` → 我们的 `LLMError` 分类
 - **`providers/*.test.ts`**：每个 provider builder 能正确调用 `resolveLanguageModel` 并构造 runtime
-- **`pool/pool.test.ts`** / **`pool/router.test.ts`**：DirectRouter 分派 + Pool register/lookup
 - **`compat/legacy-api.test.ts`**：老 API 签名行为不变
 
-### 13.2 关键回归测试（从现有 `provider.test.ts` 迁移）
+### 12.2 关键回归测试（从现有 `provider.test.ts` 迁移）
 
 1. `streamed chat returns no chunks → fallback to sync`
 2. `generic 400 不盲目建议 stream: false`
@@ -824,15 +756,15 @@ export async function chatWithTools(
 6. `openai-custom 默认 fetch 钩子剥离 stream_options.include_usage`
 7. `openai-custom fetch 钩子把 content_filter 错误体改写成 OpenAI 格式`
 
-### 13.3 集成测试
+### 12.3 集成测试
 
 保留现有 `packages/core/src/__tests__/provider.test.ts` 的行为断言，切到新 API 后行为应当**等价或更强**。
 
-### 13.4 真实 API Smoke 测试
+### 12.4 真实 API Smoke 测试
 
-见 §17。独立的 `pnpm smoke:llm` 入口，不进 CI，开发者本地按需执行。
+见 §16。独立的 `pnpm smoke:llm` 入口，不进 CI，开发者本地按需执行。
 
-## 14. 迁移计划（原子 commit 序列）
+## 13. 迁移计划（原子 commit 序列）
 
 严格遵守 `CLAUDE.md` 的原子化提交规范。每个 commit 都能独立通过 `pnpm build` 和相关测试。
 
@@ -847,26 +779,25 @@ export async function chatWithTools(
 | 7 | `refactor(llm): add runtime/runtime.ts LLMRuntime class + createRuntime` | 薄壳 class + 工厂函数 | `pnpm build` |
 | 8 | `refactor(llm): add provider configs and registry` | 4 个 provider builder + `providers/registry.ts` + `providers/defaults.ts` | `pnpm build` + provider 单测 |
 | 9 | `refactor(llm): add dispatch/config-builders` | `{match, build}[]` 表 + `resolveProviderId` | `pnpm build` + 单测 |
-| 10 | `refactor(llm): add pool/ layer (LLMPool, Router, DirectRouter)` | Layer 3 打桩 | `pnpm build` + 单测 |
-| 11 | `refactor(llm): add compat shim (legacy-api)` | 实现 `createLLMClient` / `chatCompletion` / `chatWithTools` / `PartialResponseError` 空壳，但**还不切换** `index.ts` 的导出 | `pnpm build` |
-| 12 | `refactor(llm): switch index.ts to export from compat shim, delete provider.ts` | 删除旧 `llm/provider.ts`、`index.ts` 指向 `compat/legacy-api.ts`。**关键原子点**：所有调用点切到新实现。迁移旧测试到新路径 | `pnpm build` + `pnpm test` 全绿 |
-| 13 | `test(llm): add proxy quirks regression suite` | 代理怪毛病回归测试（mock fetch 注入的怪响应）| `pnpm test` |
-| 14 | `test(llm): add tool-calling hardening tests` | tool-calling fallback + salvage 测试 | `pnpm test` |
-| 15 | `test(llm): add real-api smoke runner` | 见 §17，`__smoke__/run.ts` + root `package.json` script | `pnpm build`（smoke 本身不进 CI）|
+| 10 | `refactor(llm): add compat shim (legacy-api)` | 实现 `createLLMClient` / `chatCompletion` / `chatWithTools` / `PartialResponseError` 空壳，但**还不切换** `index.ts` 的导出 | `pnpm build` |
+| 11 | `refactor(llm): switch index.ts to export from compat shim, delete provider.ts` | 删除旧 `llm/provider.ts`、`index.ts` 指向 `compat/legacy-api.ts`。**关键原子点**：所有调用点切到新实现。迁移旧测试到新路径 | `pnpm build` + `pnpm test` 全绿 |
+| 12 | `test(llm): add proxy quirks regression suite` | 代理怪毛病回归测试（mock fetch 注入的怪响应）| `pnpm test` |
+| 13 | `test(llm): add tool-calling hardening tests` | tool-calling fallback + salvage 测试 | `pnpm test` |
+| 14 | `test(llm): add real-api smoke runner` | 见 §16，`__smoke__/run.ts` + root `package.json` script | `pnpm build`（smoke 本身不进 CI）|
 
 **分两个 PR 更稳**：
-- PR1：commits 1-12（骨架建立 + 切换实现），必须保持行为等价
-- PR2：commits 13-15（测试补充 + 硬化回归 + smoke runner）
+- PR1：commits 1-11（骨架建立 + 切换实现），必须保持行为等价
+- PR2：commits 12-14（测试补充 + 硬化回归 + smoke runner）
 
-**commit #12 的爆炸半径控制**：
-1. Commit #11 落地后本地手动跑 `pnpm -w build && pnpm -w test && pnpm -C packages/cli dev` 烟雾流程，对比主要 agent 行为
-2. Commit #12 落地后立刻再跑同一序列
-3. 任一步骤失败 → `git revert 12` 回滚单 commit
+**commit #11 的爆炸半径控制**：
+1. Commit #10 落地后本地手动跑 `pnpm -w build && pnpm -w test && pnpm -C packages/cli dev` 烟雾流程，对比主要 agent 行为
+2. Commit #11 落地后立刻再跑同一序列
+3. 任一步骤失败 → `git revert 11` 回滚单 commit
 4. 成功后再跑一次 smoke（如果凭证已配）对照真实 API 基线
 
-## 15. 风险与未决问题
+## 14. 风险与未决问题
 
-### 15.1 风险
+### 14.1 风险
 
 - **R1：`PartialResponseError` 符号保留**。`packages/core/src/index.ts` 在 re-export 列表里导出了 `PartialResponseError`。自审确认**无生产代码 `instanceof` 它**。**决定**：`errors/types.ts` 提供一个 `class PartialResponseError extends Error`（标注 `@deprecated`），保留在 `index.ts` 的导出列表里；shim 内部不再抛它，直接返回 `ChatResult.finishReason = "error_partial"` 对应的 `LLMResponse.content`。外部观察到的行为：stream 中断抢救继续返回 content，不抛错。
 
@@ -876,7 +807,7 @@ export async function chatWithTools(
 
 - **R4：`INKOS_LLM_EXTRA_<key>` 透传**。当前 `config-loader.ts:82` 支持 `INKOS_LLM_EXTRA_<key>=<value>` 把任意参数塞进 `defaults.extra`。AI SDK 的 `streamText`/`generateText` 不接受 `extra` 字段，但支持 `providerOptions` 注入 provider-specific 参数。**决定**：`orchestrator.ts` 里把 `runtime.defaults.extra` 透传为 `providerOptions[providerName]` 字段。测试要覆盖 `INKOS_LLM_EXTRA_thinking_budget=2000` 之类的真实使用路径。
 
-- **R5：关键原子 commit 的爆炸半径**。Commit #12（删 `provider.ts` 并把 `index.ts` 切到 shim + 迁移测试）一次性影响 7 个消费点。**缓解**：commit #11 是"写 shim 但不切换"，让我们能在 commit #11 之后本地手动验证 shim 行为；commit #12 是纯粹的切换 + 测试迁移，失败可以单 revert。
+- **R5：关键原子 commit 的爆炸半径**。Commit #11（删 `provider.ts` 并把 `index.ts` 切到 shim + 迁移测试）一次性影响 7 个消费点。**缓解**：commit #10 是"写 shim 但不切换"，让我们能在 commit #10 之后本地手动验证 shim 行为；commit #11 是纯粹的切换 + 测试迁移，失败可以单 revert。
 
 - **R6：`chatWithTools` 签名兼容**。自审确认 `packages/core/src/pipeline/agent.ts:312` 以**位置参数**调用 `chatWithTools(config.client, config.model, messages, TOOLS)`。shim 的 `chatWithTools` 签名必须**逐字节对齐**老签名。
 
@@ -884,7 +815,7 @@ export async function chatWithTools(
 
 - **R8（新）：AI SDK 对某些 provider 特殊参数的处理**。比如 Anthropic 的 `thinking.budget_tokens`、OpenAI 的 `reasoning_effort`，AI SDK 通过 `providerOptions: { anthropic: { thinking: {...} } }` 传入。现有 `INKOS_LLM_THINKING_BUDGET` 环境变量需要正确映射。**决定**：`resolve-model.ts` 在构造 Anthropic runtime 时把 `config.thinkingBudget` 映射为 `providerOptions.anthropic.thinking.budget_tokens`。OpenAI 的 `reasoning_effort` 通过 `providerOptions.openai.reasoningEffort` 映射（如果 extra 里有）。
 
-### 15.2 已解决的自审问题（初稿阶段 grep 验证完成）
+### 14.2 已解决的自审问题（初稿阶段 grep 验证完成）
 
 这些问题在 v1 spec 自审阶段已通过 grep 验证，答案不受方向切换影响，直接保留：
 
@@ -895,26 +826,26 @@ export async function chatWithTools(
 - **Q5（已解决）：`chatWithTools` 的调用点和签名**。grep 结果：**整个仓库只有一个调用点**——`packages/core/src/pipeline/agent.ts:312`。位置参数调用。→ shim 的 `chatWithTools` 签名必须严格对齐。
 - **Q6（已解决）：`PartialResponseError` 的外部 instanceof/import**。grep 结果：**除了 `provider.ts` 自身和 `index.ts` 的 re-export 之外，无任何 import 或 instanceof 检查**。→ 降级为空壳 `@deprecated` 类（R1 已捕获）。
 
-## 16. 成功标准
+## 15. 成功标准
 
 1. `pnpm build` 全绿
 2. `pnpm test` 全绿（老测试迁移后断言不变 + 新测试覆盖 R1-R8 风险）
 3. 老 7 个消费点**一行未修改**
 4. `packages/core/src/llm/provider.ts` 不存在（被拆分）
-5. **新增 inkos 自有代码总行数 ≤800 行**（AI SDK 提供了 SDK 包装，我们只写 orchestrator + 配置 + 路由层）
+5. **新增 inkos 自有代码总行数 ≤700 行**（删掉 Pool 后进一步收缩；我们只写 orchestrator + 配置 + 薄 shim）
 6. 手工跑一次完整小说生成 pipeline，对比重构前后的 token 使用、耗时、输出一致性
 7. 主观：加一个新的 OpenAI 兼容 provider（比如 DeepSeek）只需修改 ≤2 个文件，新增 ≤30 行
-8. `pnpm smoke:llm` 对每个配置了 API key 的 runtime 变体全绿（见 §17）
+8. `pnpm smoke:llm` 对每个配置了 API key 的 runtime 变体全绿（见 §16）
 
-## 17. Smoke 测试矩阵（真实 API 集成）
+## 16. Smoke 测试矩阵（真实 API 集成）
 
-### 17.1 动机
+### 16.1 动机
 
 Mock 单元测试能覆盖我们**能想到的**代理怪毛病；但用户明确说"遇到了相当多的 provider bug"的根源是代理兼容接口的真实行为。因此本次重构附带一个 **smoke 测试 runner**，用真实 API key 对每个 runtime 变体跑一遍核心路径，把真实世界的 quirk 变成**可复现的回归档案**。
 
 smoke 测试**不进 CI**（需要 API key、耗费实际费用），只在开发者本地按需执行：`pnpm smoke:llm`。
 
-### 17.2 环境变量清单
+### 16.2 环境变量清单
 
 与主配置 `INKOS_LLM_*` 完全隔离，使用 `INKOS_SMOKE_*` 前缀。缺失的变体自动跳过，不报错。
 
@@ -927,7 +858,7 @@ smoke 测试**不进 CI**（需要 API key、耗费实际费用），只在开�
 
 `.env.example` 里已添加一整段 commented-out 的 smoke 配置块供开发者参考和填写。
 
-### 17.3 推荐的 OpenAI 兼容代理（用户二选一或多选）
+### 16.3 推荐的 OpenAI 兼容代理（用户二选一或多选）
 
 | 服务 | Base URL | 特点 / 为什么值得测 | 大致成本 |
 |---|---|---|---|
@@ -941,7 +872,7 @@ smoke 测试**不进 CI**（需要 API key、耗费实际费用），只在开�
 
 **注**：Vercel AI SDK 官方也维护了一个 `@openrouter/ai-sdk-provider` 包（见 context7 查询结果）。如果后续决定把 OpenRouter 作为一等公民，可以直接替换 `createOpenAICompatible` 为 `createOpenRouter`。本次 smoke 测试使用 `createOpenAICompatible` 即可，目的是验证我们的通用 compat 路径。
 
-### 17.4 每个变体要跑的 6 个核心路径
+### 16.4 每个变体要跑的 6 个核心路径
 
 smoke runner 对每个配置了凭证的 runtime 按顺序执行以下 6 个测试，任一失败都标红但继续跑完其他：
 
@@ -952,7 +883,7 @@ smoke runner 对每个配置了凭证的 runtime 按顺序执行以下 6 个测�
 5. **AbortSignal 取消**：`setTimeout(() => controller.abort(), 200)`，断言抛出 AbortError 或返回的 content 大小 < 完整响应（允许 salvage）
 6. **故意打错模型名**：model 设成 `does-not-exist`，断言捕获到 `LLMError` 且 `error.type === ErrorType.ModelNotFound`
 
-### 17.5 Runner 技术细节
+### 16.5 Runner 技术细节
 
 - 实现位置：`packages/core/src/llm/__smoke__/run.ts`（不在 `__tests__` 下避免被 vitest 自动拉起）
 - 入口：根 `package.json` 新增 script `"smoke:llm": "tsx packages/core/src/llm/__smoke__/run.ts"`
@@ -961,7 +892,7 @@ smoke runner 对每个配置了凭证的 runtime 按顺序执行以下 6 个测�
 - 不耗费 > $1：内置 `maxTokens: 200` 硬上限；所有测试文本总量 < 10KB
 - 失败输出必须包含：变体 label、路径编号、错误 type、原始错误 message 前 500 字符
 
-### 17.6 Smoke 作为真正的 bug 档案
+### 16.6 Smoke 作为真正的 bug 档案
 
 每次用户报告一个代理 quirk，我们可以：
 1. 在 `__smoke__/run.ts` 里加一个复现该 quirk 的路径
