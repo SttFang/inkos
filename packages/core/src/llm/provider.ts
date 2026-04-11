@@ -192,6 +192,39 @@ function stripReservedKeys(extra: Record<string, unknown>): Record<string, unkno
   return result;
 }
 
+// === Fixed-Temperature Model Clamp ===
+//
+// 部分 thinking 模型（如 Moonshot kimi-k2.5、kimi-thinking-preview）强制要求
+// temperature === 1，其他值会被 API 直接 400 拒绝。为让这类模型能和 inkos
+// 已有的 per-call 温度调参（0.1 validator → 0.8 architect brainstorm）共存，
+// 在 provider 层统一夹制：命中名单就把传入的 temperature 强制改成 1，并对
+// 每个模型名打一次 warning 提示用户。
+
+function requiresFixedTemperature(model: string): boolean {
+  const lower = model.toLowerCase();
+  // kimi-k2.5 及其子变体（k2.5-preview 等），以及任何名字里带 "thinking" 的模型
+  return lower.startsWith("kimi-k2.5") || lower.includes("thinking");
+}
+
+const warnedFixedTemperatureModels = new Set<string>();
+
+function clampTemperatureForModel(model: string, requested: number): number {
+  if (!requiresFixedTemperature(model)) return requested;
+  if (requested === 1) return 1;
+  if (!warnedFixedTemperatureModels.has(model)) {
+    warnedFixedTemperatureModels.add(model);
+    console.warn(
+      `[inkos] 模型 "${model}" 是 thinking 模型，强制 temperature=1（原请求值 ${requested}）`,
+    );
+  }
+  return 1;
+}
+
+// 仅测试用：清空 warning 去重集合。
+export function __resetFixedTemperatureWarnings(): void {
+  warnedFixedTemperatureModels.clear();
+}
+
 // === Error Wrapping ===
 
 function wrapLLMError(error: unknown, context?: { readonly baseUrl?: string; readonly model?: string }): Error {
@@ -273,7 +306,10 @@ export async function chatCompletion(
   const perCallMax = options?.maxTokens ?? client.defaults.maxTokens;
   const cap = client.defaults.maxTokensCap;
   const resolved = {
-    temperature: options?.temperature ?? client.defaults.temperature,
+    temperature: clampTemperatureForModel(
+      model,
+      options?.temperature ?? client.defaults.temperature,
+    ),
     maxTokens: cap !== null ? Math.min(perCallMax, cap) : perCallMax,
     extra: client.defaults.extra,
   };
@@ -369,7 +405,10 @@ export async function chatWithTools(
 ): Promise<ChatWithToolsResult> {
   try {
     const resolved = {
-      temperature: options?.temperature ?? client.defaults.temperature,
+      temperature: clampTemperatureForModel(
+        model,
+        options?.temperature ?? client.defaults.temperature,
+      ),
       maxTokens: options?.maxTokens ?? client.defaults.maxTokens,
     };
     // Tool-calling always uses streaming (only used by agent loop, not by writer/auditor)
